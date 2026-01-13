@@ -14,6 +14,22 @@ import zipfile
 import nox  # pylint: disable=import-error
 
 
+# Python versions to download debugpy wheels for
+PYTHON_VERSIONS = ["310", "311", "312", "313", "314"]
+
+# Map VSCETARGET to pip platform info
+# Each entry contains a list of platform strings to try (in order of preference)
+VSCETARGET_TO_PLATFORM = {
+    "darwin-arm64": ["macosx_11_0_arm64"],
+    "darwin-x64": ["macosx_10_9_x86_64"],
+    "win32-x64": ["win_amd64"],
+    "win32-arm64": ["win_arm64"],
+    "linux-x64": ["manylinux_2_17_x86_64", "manylinux2014_x86_64"],
+    "linux-arm64": ["manylinux_2_17_aarch64"],
+    "linux-armhf": ["manylinux_2_17_armv7l"],
+}
+
+
 @nox.session()
 def lint(session: nox.Session) -> None:
     """Runs linter and formatter checks on python files."""
@@ -59,67 +75,45 @@ def install_bundled_libs(session):
     )
     session.install("packaging")
 
-    debugpy_info_json_path = pathlib.Path(__file__).parent / "debugpy_info.json"
-    debugpy_info = json.loads(debugpy_info_json_path.read_text(encoding="utf-8"))
+    vsce_target = os.environ.get("VSCETARGET", "")
+    print("VSCETARGET:", vsce_target)
 
-    target = os.environ.get("VSCETARGET", "")
-    print("target:", target)
-    if "darwin" in target:
-        wheels = debugpy_info["macOS"]
-    elif "win32-ia32" == target:
-        wheels = debugpy_info.get("win32", debugpy_info["any"])
-    elif "win32-x64" == target:
-        wheels = debugpy_info["win64"]
-    elif "linux-x64" == target:
-        wheels = debugpy_info["linux"]
-    else:
-        wheels = debugpy_info["any"]
-
-    download_debugpy_via_pip(session, wheels)
+    download_debugpy_wheels(session, vsce_target)
 
 
-def _parse_wheel_info(url: str) -> dict:
-    """Parse version and platform info from a wheel URL.
+def _get_latest_debugpy_version() -> str:
+    """Fetch the latest debugpy version from PyPI."""
+    from packaging.version import parse as version_parser
 
-    Example URL: .../debugpy-1.8.19-cp311-cp311-win_amd64.whl
-    Returns: {"version": "1.8.19", "py_ver": "311", "abi": "cp311", "platform": "win_amd64"}
-    """
-    import re
-
-    filename = url.rsplit("/", 1)[-1]
-    # Wheel filename format: {name}-{version}-{python}-{abi}-{platform}.whl
-    match = re.match(r"debugpy-([^-]+)-cp(\d+)-([^-]+)-(.+)\.whl", filename)
-    if match:
-        return {
-            "version": match.group(1),
-            "py_ver": match.group(2),
-            "abi": match.group(3),
-            "platform": match.group(4),
-        }
-    # Fallback for py2.py3-none-any wheels
-    match = re.match(r"debugpy-([^-]+)-py\d\.py\d-none-any\.whl", filename)
-    if match:
-        return {"version": match.group(1), "py_ver": None, "abi": "none", "platform": "any"}
-    raise ValueError(f"Could not parse wheel filename: {filename}")
+    data = _get_pypi_package_data("debugpy")
+    return max(data["releases"].keys(), key=version_parser)
 
 
-def download_debugpy_via_pip(session: nox.Session, wheels: list) -> None:
-    """Downloads debugpy wheels via pip and extracts them into bundled/libs.
+def download_debugpy_wheels(session: nox.Session, vsce_target: str) -> None:
+    """Downloads debugpy wheels for a VSCETARGET and extracts them into bundled/libs.
 
-    Uses pip to download by package name, allowing pip to use configured
+    Downloads wheels for Python 3.10-3.14 directly via pip, using platform
+    strings mapped from VSCETARGET. This allows pip to use configured
     index URLs (e.g., Azure Artifacts feed) instead of direct PyPI URLs.
+
+    Args:
+        session: Nox session
+        vsce_target: VSCETARGET env value (e.g., "darwin-arm64", "win32-x64")
     """
     libs_dir = pathlib.Path.cwd() / "bundled" / "libs"
     libs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Parse version and platform info from wheel URLs
-    parsed = [_parse_wheel_info(w["url"]) for w in wheels]
-    version = parsed[0]["version"]
+    version = _get_latest_debugpy_version()
+    print(f"Downloading debugpy version: {version}")
+
+    platforms = VSCETARGET_TO_PLATFORM.get(vsce_target)
 
     with tempfile.TemporaryDirectory(prefix="debugpy_wheels_") as tmp_dir:
         tmp_path = pathlib.Path(tmp_dir)
 
-        for info in parsed:
+        if platforms is None:
+            # Universal build - download pure Python wheel
+            print("Downloading universal (pure Python) wheel")
             args = [
                 "python", "-m", "pip", "download",
                 f"debugpy=={version}",
@@ -127,15 +121,34 @@ def download_debugpy_via_pip(session: nox.Session, wheels: list) -> None:
                 "--only-binary", ":all:",
                 "--dest", str(tmp_path),
             ]
-            if info["py_ver"]:
-                # Platform-specific wheel
-                args.extend(["--python-version", info["py_ver"]])
-                args.extend(["--implementation", "cp"])
-                args.extend(["--abi", info["abi"]])
-                args.extend(["--platform", info["platform"]])
-            # For none-any wheels, no platform args needed
-
             session.run(*args)
+        else:
+            # Platform-specific build - download wheels for each Python version
+            for py_ver in PYTHON_VERSIONS:
+                downloaded = False
+                for platform in platforms:
+                    if downloaded:
+                        break
+                    args = [
+                        "python", "-m", "pip", "download",
+                        f"debugpy=={version}",
+                        "--no-deps",
+                        "--only-binary", ":all:",
+                        "--dest", str(tmp_path),
+                        "--python-version", py_ver,
+                        "--implementation", "cp",
+                        "--abi", f"cp{py_ver}",
+                        "--platform", platform,
+                    ]
+                    try:
+                        session.run(*args)
+                        downloaded = True
+                    except Exception as e:
+                        print(f"No wheel for Python {py_ver} on {platform}: {e}")
+                        continue
+
+                if not downloaded:
+                    print(f"Warning: No debugpy wheel found for Python {py_ver}")
 
         wheel_paths = sorted(tmp_path.glob("debugpy-*.whl"))
         if not wheel_paths:
